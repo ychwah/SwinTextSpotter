@@ -189,19 +189,21 @@ class SWINTS(nn.Module):
             return loss_dict
 
         else:
-            outputs_class, outputs_coord, outputs_mask,out_rec = self.head(features, proposal_boxes, proposal_feats, mask_encoding=self.mask_encoding)
+            outputs_class, outputs_coord, outputs_mask, out_rec = self.head(features, proposal_boxes, proposal_feats, mask_encoding=self.mask_encoding)
             output = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1], 'pred_masks': outputs_mask[-1]}
+
             box_cls = output["pred_logits"]
             box_pred = output["pred_boxes"]
-            mask_pred = output["pred_masks"].unsqueeze(dim=2)
-            results = Instances(images.image_sizes[0])
-            results.pred_boxes = Boxes(box_pred)
-            results.scores = box_cls
-            results.pred_masks = mask_pred.squeeze(1)
-            results.pred_rec = out_rec
-            results = [results]
+            mask_pred = output["pred_masks"]
+
             processed_results = []
-            for results_per_image, input_per_image, image_size in zip(results, batched_inputs, images.image_sizes):
+            for i, (input_per_image, image_size) in enumerate(zip(batched_inputs, images.image_sizes)):
+                results_per_image = Instances(image_size)
+                results_per_image.pred_boxes = Boxes(box_pred[i])
+                results_per_image.scores = box_cls[i]
+                results_per_image.pred_masks = mask_pred[i]
+                results_per_image.pred_rec = out_rec[i]
+
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
                 r = detector_postprocess(results_per_image, height, width)
