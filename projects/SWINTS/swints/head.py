@@ -150,10 +150,11 @@ class DynamicHead(nn.Module):
 
         # Use separate variables to avoid shadowing and handle batches correctly
         in_mask_logits = mask_logits
-        in_proposal_features = proposal_features
-        pred_mask = in_mask_logits.detach()
-
         N, nr_boxes = bboxes.shape[:2]
+        # Reshape proposal_features back to (N, nr_boxes, hidden_dim) if it was flattened
+        # RCNNHead returns (1, N*nr_boxes, hidden_dim)
+        in_proposal_features = proposal_features.view(N, nr_boxes, self.hidden_dim)
+        pred_mask = in_mask_logits.detach()
         if targets:
             output = {'pred_logits': class_logits, 'pred_boxes': pred_bboxes, 'pred_masks': in_mask_logits}
             indices = matcher(output, targets, mask_encoding)
