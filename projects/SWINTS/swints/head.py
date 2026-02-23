@@ -194,8 +194,7 @@ class DynamicHead(nn.Module):
 
                 mask_pred_per_image = mask_encoding.decoder(in_mask_logits[b], is_train=False)
                 mask_pred_per_image = mask_pred_per_image.view(-1, 1, 28, 28)
-                n, c, w, h = mask_pred_per_image.size()
-                mask_pred_per_image = torch.repeat_interleave(mask_pred_per_image, num_cls, 1).view(-1, c, w, h)
+                mask_pred_per_image = torch.repeat_interleave(mask_pred_per_image, num_cls, 1).view(-1, 28, 28)
                 mask_pred_per_image = mask_pred_per_image[topk_indices]
 
                 curr_prop_feat = in_proposal_features[b].view(-1, 1, self.hidden_dim).repeat(1, num_cls, 1).view(-1, self.hidden_dim)
@@ -220,7 +219,7 @@ class DynamicHead(nn.Module):
             gt_masks = torch.cat((gt_masks,masks_pred),0)
         else:
             rec_map = self.box_pooler_rec(features, proposal_boxes_pred)
-            gt_masks = torch.cat(out_gt_masks).cuda()
+            gt_masks = torch.cat(out_gt_masks).to(rec_map.device)
             proposal_features = torch.cat(out_proposal_features)
             # Use per-image proposal count for rec_stage batching
             nr_boxes_per_img = num_proposals
