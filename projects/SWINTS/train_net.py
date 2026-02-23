@@ -132,7 +132,8 @@ class ProgressiveMultiScaleInference(nn.Module):
                     max_scores,
                     iou_threshold=0.7
                 )
-                merged_instances = merged_instances[keep]
+                # Move keep to cpu to avoid device mismatch with CPU-based fields like pred_rec
+                merged_instances = merged_instances[keep.to("cpu")]
 
             all_results.append({"instances": merged_instances})
 
@@ -145,13 +146,12 @@ class Trainer(DefaultTrainer):
 #     """
 
     @classmethod
-    def build_model(cls, cfg):
-        model = super().build_model(cfg)
-        # Avoid double-wrapping by checking if already wrapped
-        if not cls.training and cfg.TEST.AUG.ENABLED and not isinstance(model, ProgressiveMultiScaleInference):
+    def test(cls, cfg, model, evaluators=None):
+        # Wrap the model for multi-scale inference during evaluation if TTA is enabled
+        if cfg.TEST.AUG.ENABLED and not isinstance(model, ProgressiveMultiScaleInference):
             scales = cfg.TEST.AUG.get("SCALES", [1.0, 1.25, 1.5])
             model = ProgressiveMultiScaleInference(model, scales=scales)
-        return model
+        return super().test(cfg, model, evaluators)
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
@@ -237,10 +237,6 @@ def main(args):
     cfg = setup(args)
 
     if args.eval_only:
-        # Trainer.build_model will now handle ProgressiveMultiScaleInference wrapping
-        # because DefaultTrainer sets Trainer.training = False when build_model is called from test or eval
-        # But for safety in eval_only, we can explicitly set it.
-        Trainer.training = False
         model = Trainer.build_model(cfg)
         DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(cfg.MODEL.WEIGHTS, resume=args.resume)
 
