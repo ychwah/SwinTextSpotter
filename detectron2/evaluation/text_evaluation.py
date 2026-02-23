@@ -399,29 +399,33 @@ class TextEvaluator(DatasetEvaluator):
         if self.nms_enable:
             polys = []
             filtered_scores = []
-            for mask, score in zip(masks, scores):
+            filtered_indices = []
+            for idx, (mask, score) in enumerate(zip(masks, scores)):
                 if not len(mask.polygons):
                     continue
                 polys.append(np.concatenate(mask.polygons).reshape(-1,2))
                 filtered_scores.append(score)
-            keep = self.py_cpu_pnms(polys, filtered_scores, 0.5)
+                filtered_indices.append(idx)
+
+            keep_in_filtered = self.py_cpu_pnms(polys, filtered_scores, 0.5)
+            keep_indices = set([filtered_indices[k] for k in keep_in_filtered])
 
         results = []
-        i = 0
-        for mask, rec, score in zip(masks, recs, scores):
+        for idx, (mask, rec, score) in enumerate(zip(masks, recs, scores)):
             if not len(mask.polygons):
                 continue
             if self.nms_enable:
-                if i not in keep:
-                    i = i+1
+                if idx not in keep_indices:
                     continue
-            poly = polys[i]
+
+            # Find corresponding poly in the list
+            # We can just re-extract it from mask for simplicity and safety
+            poly = np.concatenate(mask.polygons).reshape(-1,2)
             if 'icdar2015'  in self.dataset_name:
                 poly = polygon2rbox(poly, height, width)
                 poly = np.array(poly)
             rec_string = self.decode(rec)
             if not len(rec_string):
-                i = i+1
                 continue
             result = {
                 "image_id": img_id,
@@ -431,7 +435,6 @@ class TextEvaluator(DatasetEvaluator):
                 "score": score,
             }
             results.append(result)
-            i = i+1
         return results
   
     def decode(self, rec):

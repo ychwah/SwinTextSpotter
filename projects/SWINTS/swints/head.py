@@ -259,8 +259,8 @@ class DynamicHead(nn.Module):
             rec_result = self.rec_stage(rec_map, rec_proposal_features, gt_masks, N, nr_boxes, idx, target_rec)
         else:
             rec_result = self.rec_stage(rec_map, rec_proposal_features, gt_masks, N, nr_boxes)
-            # rec_result is a list of numpy arrays, convert to tensor efficiently
-            rec_result = torch.from_numpy(np.stack(rec_result)).to(device=rec_map.device)
+            # Efficiently convert list of numpy arrays to tensor on CPU first to avoid warnings and speed up
+            rec_result = torch.from_numpy(np.array(rec_result))
         if self.return_intermediate:
             return torch.stack(inter_class_logits), torch.stack(inter_pred_bboxes), torch.stack(inter_pred_masks), rec_result
         return class_logits[None], pred_bboxes[None], mask_logits[None]

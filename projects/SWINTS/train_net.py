@@ -70,8 +70,14 @@ class ProgressiveMultiScaleInference(nn.Module):
                 multi_scale_instances.append(base_instances)
 
             # 2. Progressive check: run additional scales only if needed
-            # e.g., if few detections found or image is small
-            needs_more = len(base_instances) < 5 or max_dim < 1000
+            # For SWINTS, base_instances always has TEST_NUM_PROPOSALS (usually 100).
+            # We run more scales if the model is not confident or the image is small.
+            scores = base_instances.scores
+            if scores.dim() > 1:
+                scores = scores.max(dim=1)[0]
+
+            num_confident = (scores > 0.4).sum().item()
+            needs_more = num_confident < 8 or max_dim < 1100
 
             if needs_more:
                 additional_inputs = []
@@ -104,48 +110,53 @@ class ProgressiveMultiScaleInference(nn.Module):
                         for out in additional_outputs:
                             multi_scale_instances.append(out["instances"])
 
-            # Concatenate all instances for this image
-            merged_instances = Instances.cat(multi_scale_instances)
+            # 3. Merge results
+            if len(multi_scale_instances) == 1:
+                # If only one scale, return as is (baseline behavior)
+                merged_instances = multi_scale_instances[0]
+            else:
+                # Multiple scales: apply merging and cross-scale boosting
+                # Add scale_id to each instance to avoid intra-scale boosting
+                for idx, inst in enumerate(multi_scale_instances):
+                    inst.scale_id = torch.full((len(inst),), idx, device=inst.scores.device)
 
-            # Apply NMS and simple score boosting for cross-scale consistency
-            if len(merged_instances) > 0:
-                # 0. Filter out boxes with zero or near-zero area to prevent evaluation issues
-                areas = merged_instances.pred_boxes.area()
-                valid_area = areas > 0.1
-                merged_instances = merged_instances[valid_area]
+                merged_instances = Instances.cat(multi_scale_instances)
 
-            if len(merged_instances) > 0:
-                # 3. Simple score boost for boxes detected at multiple scales
-                if len(merged_instances) > 1:
-                    # pairwise_iou expects Boxes objects
+                if len(merged_instances) > 0:
+                    # Filter out boxes with zero or near-zero area
+                    areas = merged_instances.pred_boxes.area()
+                    merged_instances = merged_instances[areas > 0.1]
+
+                if len(merged_instances) > 0:
+                    # Cross-scale score boost
                     ious = pairwise_iou(merged_instances.pred_boxes, merged_instances.pred_boxes)
-                    # For each box, find how many other boxes overlap significantly (> 0.8 IoU)
-                    num_overlaps = (ious > 0.8).sum(dim=1).float()
-                    # Boost score if detected in multiple scales (max 0.1 boost)
-                    boost = torch.clamp((num_overlaps - 1) * 0.05, max=0.1)
+                    scale_ids = merged_instances.scale_id
+                    # Different scales mask: True where scale_ids are different
+                    diff_scales = scale_ids.unsqueeze(0) != scale_ids.unsqueeze(1)
+
+                    # Overlap from different scales
+                    cross_overlaps = (ious > 0.8) & diff_scales
+                    num_cross_overlaps = cross_overlaps.sum(dim=1).float()
+
+                    # Boost score (max 0.15 boost for multi-scale consistency)
+                    boost = torch.clamp(num_cross_overlaps * 0.05, max=0.15)
 
                     if merged_instances.scores.dim() > 1:
-                        # multi-class scores
                         merged_instances.scores = merged_instances.scores + boost.unsqueeze(1)
                     else:
                         merged_instances.scores = merged_instances.scores + boost
                     merged_instances.scores = torch.clamp(merged_instances.scores, max=1.0)
 
-                # 4. Use box NMS with slightly higher threshold to keep candidates
-                scores = merged_instances.scores
-                if scores.dim() > 1:
-                    max_scores, _ = scores.max(dim=1)
-                else:
-                    max_scores = scores
+                    # NMS to remove redundancies across scales
+                    scores = merged_instances.scores
+                    max_scores = scores.max(dim=1)[0] if scores.dim() > 1 else scores
 
-                keep = nms(
-                    merged_instances.pred_boxes.tensor,
-                    max_scores,
-                    iou_threshold=0.6 # Slightly tighter NMS to improve speed
-                )
-                # Move keep to cpu to avoid device mismatch with CPU-based fields like pred_rec
-                merged_instances = merged_instances[keep.to("cpu")]
+                    # Keep a bit more to let TextEvaluator's polygon NMS do the final work
+                    keep = nms(merged_instances.pred_boxes.tensor, max_scores, iou_threshold=0.7)
+                    merged_instances = merged_instances[keep.to("cpu")]
 
+            # Ensure all tensors are on CPU for the evaluator
+            merged_instances = merged_instances.to(torch.device("cpu"))
             all_results.append({"instances": merged_instances})
 
         return all_results
