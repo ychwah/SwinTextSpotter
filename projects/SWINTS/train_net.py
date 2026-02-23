@@ -12,9 +12,12 @@ This script is a simplified version of the training script in detectron2/tools.
 import os
 import itertools
 import time
+import copy
 from typing import Any, Dict, List, Set
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
@@ -23,8 +26,64 @@ from detectron2.data import MetadataCatalog, build_detection_train_loader
 from detectron2.engine import AutogradProfiler, DefaultTrainer, default_argument_parser, default_setup, launch
 from detectron2.evaluation import COCOEvaluator, verify_results, TextEvaluator
 from detectron2.solver.build import maybe_add_gradient_clipping
+from detectron2.structures import Instances
+from detectron2.layers import nms
 
 from swints import SWINTSDatasetMapper, add_SWINTS_config
+
+
+class ProgressiveMultiScaleInference(nn.Module):
+    def __init__(self, model, scales=[0.5, 0.75, 1.0, 1.25, 1.5]):
+        super().__init__()
+        self.model = model
+        self.scales = scales
+
+    def forward(self, batched_inputs):
+        if self.training:
+            return self.model(batched_inputs)
+
+        all_results = []
+        for input_dict in batched_inputs:
+            image = input_dict["image"]
+            c, h, w = image.shape
+
+            multi_scale_instances = []
+            for scale in self.scales:
+                if scale == 1.0:
+                    curr_image = image
+                else:
+                    new_h, new_w = int(h * scale), int(w * scale)
+                    curr_image = F.interpolate(
+                        image.unsqueeze(0).float(),
+                        size=(new_h, new_w),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(0).to(image.dtype)
+
+                curr_input = copy.copy(input_dict)
+                curr_input["image"] = curr_image
+                # The model will use curr_input["height"] and ["width"] for postprocessing
+                # which are the ORIGINAL dimensions.
+                with torch.no_grad():
+                    output = self.model([curr_input])[0]
+                    multi_scale_instances.append(output["instances"])
+
+            # Concatenate all instances for this image
+            merged_instances = Instances.cat(multi_scale_instances)
+
+            # Apply NMS to merge detections from different scales
+            if len(merged_instances) > 0:
+                # Use box NMS to reduce redundancy before evaluator's polygon NMS
+                keep = nms(
+                    merged_instances.pred_boxes.tensor,
+                    merged_instances.scores.max(dim=1)[0] if merged_instances.scores.dim() > 1 else merged_instances.scores,
+                    iou_threshold=0.5
+                )
+                merged_instances = merged_instances[keep]
+
+            all_results.append({"instances": merged_instances})
+
+        return all_results
 
 
 class Trainer(DefaultTrainer):
@@ -118,6 +177,11 @@ def main(args):
     if args.eval_only:
         model = Trainer.build_model(cfg)
         DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(cfg.MODEL.WEIGHTS, resume=args.resume)
+
+        if cfg.TEST.AUG.ENABLED:
+            scales = cfg.TEST.AUG.get("SCALES", [0.5, 0.75, 1.0, 1.25, 1.5])
+            model = ProgressiveMultiScaleInference(model, scales=scales)
+
         res = Trainer.test(cfg, model)
         if comm.is_main_process():
             verify_results(cfg, res)
