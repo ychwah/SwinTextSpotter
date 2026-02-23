@@ -26,17 +26,18 @@ from detectron2.data import MetadataCatalog, build_detection_train_loader
 from detectron2.engine import AutogradProfiler, DefaultTrainer, default_argument_parser, default_setup, launch
 from detectron2.evaluation import COCOEvaluator, verify_results, TextEvaluator
 from detectron2.solver.build import maybe_add_gradient_clipping
-from detectron2.structures import Instances
+from detectron2.structures import Instances, pairwise_iou
 from detectron2.layers import nms
 
 from swints import SWINTSDatasetMapper, add_SWINTS_config
 
 
 class ProgressiveMultiScaleInference(nn.Module):
-    def __init__(self, model, scales=[0.5, 0.75, 1.0, 1.25, 1.5]):
+    def __init__(self, model, scales=None):
         super().__init__()
         self.model = model
-        self.scales = scales
+        # Default scales if not provided
+        self.scales = scales if scales is not None else [1.0, 1.25, 1.5]
 
     def forward(self, batched_inputs):
         if self.training:
@@ -46,13 +47,44 @@ class ProgressiveMultiScaleInference(nn.Module):
         for input_dict in batched_inputs:
             image = input_dict["image"]
             c, h, w = image.shape
+            max_dim = max(h, w)
+
+            # Use provided scales, but apply adaptive filtering for speed
+            curr_scales = []
+            for s in self.scales:
+                # Heuristic to skip large scales for already large images
+                if s > 1.0 and max_dim > 1500:
+                    continue
+                if s > 1.25 and max_dim > 1000:
+                    continue
+                curr_scales.append(s)
+
+            if not curr_scales:
+                curr_scales = [1.0]
 
             multi_scale_instances = []
-            for scale in self.scales:
-                if scale == 1.0:
-                    curr_image = image
-                else:
+            # 1. First pass (Base Scale)
+            with torch.no_grad():
+                output = self.model([input_dict])[0]
+                base_instances = output["instances"]
+                multi_scale_instances.append(base_instances)
+
+            # 2. Progressive check: run additional scales only if needed
+            # e.g., if few detections found or image is small
+            needs_more = len(base_instances) < 5 or max_dim < 1000
+
+            if needs_more:
+                for scale in curr_scales:
+                    if scale == 1.0:
+                        continue
+
+                    # Cap maximum resolution to prevent extreme slowness/OOM
+                    max_res = 2240
                     new_h, new_w = int(h * scale), int(w * scale)
+                    if max(new_h, new_w) > max_res:
+                        scale_factor = max_res / max(new_h, new_w)
+                        new_h, new_w = int(new_h * scale_factor), int(new_w * scale_factor)
+
                     curr_image = F.interpolate(
                         image.unsqueeze(0).float(),
                         size=(new_h, new_w),
@@ -60,24 +92,45 @@ class ProgressiveMultiScaleInference(nn.Module):
                         align_corners=False
                     ).squeeze(0).to(image.dtype)
 
-                curr_input = copy.copy(input_dict)
-                curr_input["image"] = curr_image
-                # The model will use curr_input["height"] and ["width"] for postprocessing
-                # which are the ORIGINAL dimensions.
-                with torch.no_grad():
-                    output = self.model([curr_input])[0]
-                    multi_scale_instances.append(output["instances"])
+                    curr_input = copy.copy(input_dict)
+                    curr_input["image"] = curr_image
+
+                    with torch.no_grad():
+                        output = self.model([curr_input])[0]
+                        multi_scale_instances.append(output["instances"])
 
             # Concatenate all instances for this image
             merged_instances = Instances.cat(multi_scale_instances)
 
-            # Apply NMS to merge detections from different scales
+            # Apply NMS and simple score boosting for cross-scale consistency
             if len(merged_instances) > 0:
-                # Use box NMS to reduce redundancy before evaluator's polygon NMS
+                # 3. Simple score boost for boxes detected at multiple scales
+                if len(merged_instances) > 1:
+                    # pairwise_iou expects Boxes objects
+                    ious = pairwise_iou(merged_instances.pred_boxes, merged_instances.pred_boxes)
+                    # For each box, find how many other boxes overlap significantly (> 0.8 IoU)
+                    num_overlaps = (ious > 0.8).sum(dim=1).float()
+                    # Boost score if detected in multiple scales (max 0.1 boost)
+                    boost = torch.clamp((num_overlaps - 1) * 0.05, max=0.1)
+
+                    if merged_instances.scores.dim() > 1:
+                        # multi-class scores
+                        merged_instances.scores = merged_instances.scores + boost.unsqueeze(1)
+                    else:
+                        merged_instances.scores = merged_instances.scores + boost
+                    merged_instances.scores = torch.clamp(merged_instances.scores, max=1.0)
+
+                # 4. Use box NMS with slightly higher threshold to keep candidates
+                scores = merged_instances.scores
+                if scores.dim() > 1:
+                    max_scores, _ = scores.max(dim=1)
+                else:
+                    max_scores = scores
+
                 keep = nms(
                     merged_instances.pred_boxes.tensor,
-                    merged_instances.scores.max(dim=1)[0] if merged_instances.scores.dim() > 1 else merged_instances.scores,
-                    iou_threshold=0.5
+                    max_scores,
+                    iou_threshold=0.7
                 )
                 merged_instances = merged_instances[keep]
 
@@ -90,6 +143,15 @@ class Trainer(DefaultTrainer):
 #     """
 #     Extension of the Trainer class adapted to SparseRCNN.
 #     """
+
+    @classmethod
+    def build_model(cls, cfg):
+        model = super().build_model(cfg)
+        # Avoid double-wrapping by checking if already wrapped
+        if not cls.training and cfg.TEST.AUG.ENABLED and not isinstance(model, ProgressiveMultiScaleInference):
+            scales = cfg.TEST.AUG.get("SCALES", [1.0, 1.25, 1.5])
+            model = ProgressiveMultiScaleInference(model, scales=scales)
+        return model
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
@@ -175,12 +237,12 @@ def main(args):
     cfg = setup(args)
 
     if args.eval_only:
+        # Trainer.build_model will now handle ProgressiveMultiScaleInference wrapping
+        # because DefaultTrainer sets Trainer.training = False when build_model is called from test or eval
+        # But for safety in eval_only, we can explicitly set it.
+        Trainer.training = False
         model = Trainer.build_model(cfg)
         DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(cfg.MODEL.WEIGHTS, resume=args.resume)
-
-        if cfg.TEST.AUG.ENABLED:
-            scales = cfg.TEST.AUG.get("SCALES", [0.5, 0.75, 1.0, 1.25, 1.5])
-            model = ProgressiveMultiScaleInference(model, scales=scales)
 
         res = Trainer.test(cfg, model)
         if comm.is_main_process():
