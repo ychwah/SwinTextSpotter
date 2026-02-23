@@ -194,7 +194,9 @@ class DynamicHead(nn.Module):
 
                 mask_pred_per_image = mask_encoding.decoder(in_mask_logits[b], is_train=False)
                 mask_pred_per_image = mask_pred_per_image.view(-1, 1, 28, 28)
-                mask_pred_per_image = torch.repeat_interleave(mask_pred_per_image, num_cls, 1).view(-1, 28, 28)
+                # Keep 4D (N, 1, 28, 28) for detector_postprocess.
+                # We need to reshape to (100*num_cls, 1, 28, 28) to index with topk_indices
+                mask_pred_per_image = torch.repeat_interleave(mask_pred_per_image, num_cls, 1).view(-1, 1, 28, 28)
                 mask_pred_per_image = mask_pred_per_image[topk_indices]
 
                 curr_prop_feat = in_proposal_features[b].view(-1, 1, self.hidden_dim).repeat(1, num_cls, 1).view(-1, self.hidden_dim)
@@ -219,7 +221,9 @@ class DynamicHead(nn.Module):
             gt_masks = torch.cat((gt_masks,masks_pred),0)
         else:
             rec_map = self.box_pooler_rec(features, proposal_boxes_pred)
-            gt_masks = torch.cat(out_gt_masks).to(rec_map.device)
+            # Squeeze to 3D for rec_stage (which does unsqueeze(1) before rescale)
+            # out_gt_masks contains (num_proposals, 1, 28, 28) tensors
+            gt_masks = torch.cat(out_gt_masks).to(rec_map.device).squeeze(1)
             proposal_features = torch.cat(out_proposal_features)
             # Use per-image proposal count for rec_stage batching
             nr_boxes_per_img = num_proposals
@@ -256,7 +260,7 @@ class DynamicHead(nn.Module):
             proposal_features, gt_masks, idx, rec_map, target_rec = \
                 self.extra_rec_feat(matcher, mask_encoding, targets, N, bboxes, class_logits, pred_bboxes, mask_logits, proposal_features, features)
         else:
-            inter_class_logits, inter_pred_bboxes, inter_pred_masks, inter_pred_label, proposal_features, gt_masks, idx, rec_map, nr_boxes = \
+            inf_class_logits, inf_pred_bboxes, inf_pred_masks, inf_pred_label, proposal_features, gt_masks, idx, rec_map, nr_boxes = \
                 self.extra_rec_feat(matcher, mask_encoding, targets, N, bboxes, class_logits, pred_bboxes, mask_logits, proposal_features, features)
        
         rec_map = self.cnn(rec_map)
@@ -268,9 +272,14 @@ class DynamicHead(nn.Module):
             rec_result = self.rec_stage(rec_map, rec_proposal_features, gt_masks, N, nr_boxes)
             # Efficiently convert list of numpy arrays to tensor on CPU first to avoid warnings and speed up
             rec_result = torch.from_numpy(np.array(rec_result))
-        if self.return_intermediate:
-            return torch.stack(inter_class_logits), torch.stack(inter_pred_bboxes), torch.stack(inter_pred_masks), rec_result
-        return class_logits, bboxes, mask_logits, rec_result
+        if self.training:
+            if self.return_intermediate:
+                return torch.stack(inter_class_logits), torch.stack(inter_pred_bboxes), torch.stack(inter_pred_masks), rec_result
+            return class_logits, bboxes, mask_logits, rec_result
+        else:
+            # Inference path: use stacked results from extra_rec_feat
+            # Returns (B, N, ...), (B, N, 4, ...), (B, N, 1, 28, 28), (B, N, L), (B, N)
+            return torch.stack(inf_class_logits), torch.stack(inf_pred_bboxes), torch.stack(inf_pred_masks), rec_result, torch.stack(inf_pred_label)
 
 
 class RCNNHead(nn.Module):
