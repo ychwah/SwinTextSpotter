@@ -190,11 +190,22 @@ class SWINTS(nn.Module):
 
         else:
             outputs_class, outputs_coord, outputs_mask, out_rec = self.head(features, proposal_boxes, proposal_feats, mask_encoding=self.mask_encoding)
-            output = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1], 'pred_masks': outputs_mask[-1]}
 
-            box_cls = output["pred_logits"]
-            box_pred = output["pred_boxes"]
-            mask_pred = output["pred_masks"]
+            # During inference, DynamicHead returns stacked results for the batch if return_intermediate is True.
+            # In SWINTS, it usually returns (B, N, K) or (L, B, N, K).
+            if outputs_class.dim() == 4:
+                box_cls = outputs_class[-1]
+                box_pred = outputs_coord[-1]
+                mask_pred = outputs_mask[-1]
+            else:
+                box_cls = outputs_class
+                box_pred = outputs_coord
+                mask_pred = outputs_mask
+
+            # out_rec is usually (B*N, L) during inference.
+            if out_rec.dim() == 2:
+                bs = len(batched_inputs)
+                out_rec = out_rec.view(bs, -1, out_rec.shape[-1])
 
             processed_results = []
             for i, (input_per_image, image_size) in enumerate(zip(batched_inputs, images.image_sizes)):
