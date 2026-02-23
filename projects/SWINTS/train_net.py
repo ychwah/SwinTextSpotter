@@ -74,6 +74,7 @@ class ProgressiveMultiScaleInference(nn.Module):
             needs_more = len(base_instances) < 5 or max_dim < 1000
 
             if needs_more:
+                additional_inputs = []
                 for scale in curr_scales:
                     if scale == 1.0:
                         continue
@@ -94,10 +95,14 @@ class ProgressiveMultiScaleInference(nn.Module):
 
                     curr_input = copy.copy(input_dict)
                     curr_input["image"] = curr_image
+                    additional_inputs.append(curr_input)
 
+                if additional_inputs:
                     with torch.no_grad():
-                        output = self.model([curr_input])[0]
-                        multi_scale_instances.append(output["instances"])
+                        # Run additional scales in parallel via batching
+                        additional_outputs = self.model(additional_inputs)
+                        for out in additional_outputs:
+                            multi_scale_instances.append(out["instances"])
 
             # Concatenate all instances for this image
             merged_instances = Instances.cat(multi_scale_instances)
