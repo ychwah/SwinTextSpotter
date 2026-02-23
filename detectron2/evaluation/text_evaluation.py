@@ -398,11 +398,13 @@ class TextEvaluator(DatasetEvaluator):
 
         if self.nms_enable:
             polys = []
-            for mask in masks:
+            filtered_scores = []
+            for mask, score in zip(masks, scores):
                 if not len(mask.polygons):
                     continue
                 polys.append(np.concatenate(mask.polygons).reshape(-1,2))
-            keep = self.py_cpu_pnms(polys,scores,0.5)
+                filtered_scores.append(score)
+            keep = self.py_cpu_pnms(polys, filtered_scores, 0.5)
 
         results = []
         i = 0
@@ -462,10 +464,7 @@ class TextEvaluator(DatasetEvaluator):
             for jl in range(il, len(pts)):
                 polyj = Polygon(pts[jl].tolist()).buffer(0.001)
                 inS = poly.intersection(polyj)
-                try:
-                    inter_areas[il][jl] = inS.area
-                except:
-                    import pdb;pdb.set_trace()
+                inter_areas[il][jl] = inS.area
                 inter_areas[jl][il] = inS.area
 
         keep = []
@@ -473,7 +472,7 @@ class TextEvaluator(DatasetEvaluator):
             i = order[0]
             keep.append(i)
 
-            ovr = inter_areas[i][order[1:]] / ((areas[i]) + areas[order[1:]] - inter_areas[i][order[1:]])
+            ovr = inter_areas[i][order[1:]] / ((areas[i]) + areas[order[1:]] - inter_areas[i][order[1:]] + 1e-8)
             inds = np.where(ovr <= thresh)[0]
             order = order[inds + 1]
 

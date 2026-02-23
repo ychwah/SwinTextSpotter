@@ -109,6 +109,12 @@ class ProgressiveMultiScaleInference(nn.Module):
 
             # Apply NMS and simple score boosting for cross-scale consistency
             if len(merged_instances) > 0:
+                # 0. Filter out boxes with zero or near-zero area to prevent evaluation issues
+                areas = merged_instances.pred_boxes.area()
+                valid_area = areas > 0.1
+                merged_instances = merged_instances[valid_area]
+
+            if len(merged_instances) > 0:
                 # 3. Simple score boost for boxes detected at multiple scales
                 if len(merged_instances) > 1:
                     # pairwise_iou expects Boxes objects
@@ -135,7 +141,7 @@ class ProgressiveMultiScaleInference(nn.Module):
                 keep = nms(
                     merged_instances.pred_boxes.tensor,
                     max_scores,
-                    iou_threshold=0.7
+                    iou_threshold=0.6 # Slightly tighter NMS to improve speed
                 )
                 # Move keep to cpu to avoid device mismatch with CPU-based fields like pred_rec
                 merged_instances = merged_instances[keep.to("cpu")]
