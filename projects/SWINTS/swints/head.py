@@ -147,11 +147,15 @@ class DynamicHead(nn.Module):
         gt_boxes = list()
         proposal_boxes_pred = list()
         masks_pred = list()
-        pred_mask = mask_logits.detach()
+
+        # Use separate variables to avoid shadowing and handle batches correctly
+        in_mask_logits = mask_logits
+        in_proposal_features = proposal_features
+        pred_mask = in_mask_logits.detach()
 
         N, nr_boxes = bboxes.shape[:2]
         if targets:
-            output = {'pred_logits': class_logits, 'pred_boxes': pred_bboxes, 'pred_masks': mask_logits}
+            output = {'pred_logits': class_logits, 'pred_boxes': pred_bboxes, 'pred_masks': in_mask_logits}
             indices = matcher(output, targets, mask_encoding)
             idx = _get_src_permutation_idx(indices)
             target_rec = torch.cat([t['rec'][i] for t, (_, i) in zip(targets, indices)], dim=0)
@@ -159,12 +163,16 @@ class DynamicHead(nn.Module):
         else:
             idx = None
             scores = torch.sigmoid(class_logits)
-            labels = torch.arange(2, device=bboxes.device).\
-                    unsqueeze(0).repeat(self.train_num_proposal, 1).flatten(0, 1)
+            num_cls = class_logits.shape[-1]
+            labels = torch.arange(num_cls, device=bboxes.device).\
+                    unsqueeze(0).repeat(nr_boxes, 1).flatten(0, 1)
             inter_class_logits = []
             inter_pred_bboxes = []
             inter_pred_masks = []
             inter_pred_label = []
+            out_proposal_features = []
+            out_gt_masks = []
+
         for b in range(N):
             if targets:
                 gt_boxes.append(Boxes(targets[b]['boxes_xyxy'][indices[b][1]]))
@@ -180,18 +188,23 @@ class DynamicHead(nn.Module):
                 num_proposals = self.cfg.MODEL.SWINTS.TEST_NUM_PROPOSALS
                 scores_per_image, topk_indices = scores[b].flatten(0, 1).topk(num_proposals, sorted=False)
                 labels_per_image = labels[topk_indices]
-                box_pred_per_image = bboxes[b].view(-1, 1, 4).repeat(1, 2, 1).view(-1, 4)
+
+                box_pred_per_image = bboxes[b].view(-1, 1, 4).repeat(1, num_cls, 1).view(-1, 4)
                 box_pred_per_image = box_pred_per_image[topk_indices]
-                mask_pred_per_image = mask_logits.view(-1, self.cfg.MODEL.SWINTS.MASK_DIM)
-                mask_pred_per_image = mask_encoding.decoder(mask_pred_per_image, is_train=False)
+
+                mask_pred_per_image = mask_encoding.decoder(in_mask_logits[b], is_train=False)
                 mask_pred_per_image = mask_pred_per_image.view(-1, 1, 28, 28)
                 n, c, w, h = mask_pred_per_image.size()
-                mask_pred_per_image = torch.repeat_interleave(mask_pred_per_image,2,1).view(-1, c, w, h)
+                mask_pred_per_image = torch.repeat_interleave(mask_pred_per_image, num_cls, 1).view(-1, c, w, h)
                 mask_pred_per_image = mask_pred_per_image[topk_indices]
-                proposal_features = proposal_features[b].view(-1, 1, self.hidden_dim).repeat(1, 2, 1).view(-1, self.hidden_dim)
-                proposal_features = proposal_features[topk_indices]
+
+                curr_prop_feat = in_proposal_features[b].view(-1, 1, self.hidden_dim).repeat(1, num_cls, 1).view(-1, self.hidden_dim)
+                curr_prop_feat = curr_prop_feat[topk_indices]
+
                 proposal_boxes_pred.append(Boxes(box_pred_per_image))
-                gt_masks.append(mask_pred_per_image)
+                out_gt_masks.append(mask_pred_per_image)
+                out_proposal_features.append(curr_prop_feat)
+
                 inter_class_logits.append(scores_per_image)
                 inter_pred_bboxes.append(box_pred_per_image)
                 inter_pred_masks.append(mask_pred_per_image)
@@ -207,20 +220,15 @@ class DynamicHead(nn.Module):
             gt_masks = torch.cat((gt_masks,masks_pred),0)
         else:
             rec_map = self.box_pooler_rec(features, proposal_boxes_pred)
-            gt_masks = torch.cat(gt_masks).cuda()
-            nr_boxes = rec_map.shape[0]
-        if targets:
-            rec_map = rec_map[:self.cfg.MODEL.REC_HEAD.BATCH_SIZE]
-        else:
-            gt_masks_b = torch.full_like(gt_masks,0).cuda()
-            gt_masks_b[gt_masks>0.4]=1
-            gt_masks_b = gt_masks_b.squeeze()
-            gt_masks = gt_masks_b
-            del gt_masks_b
+            gt_masks = torch.cat(out_gt_masks).cuda()
+            proposal_features = torch.cat(out_proposal_features)
+            # Use per-image proposal count for rec_stage batching
+            nr_boxes_per_img = num_proposals
+
         if targets:
             return proposal_features, gt_masks[:self.cfg.MODEL.REC_HEAD.BATCH_SIZE], idx, rec_map, target_rec[:self.cfg.MODEL.REC_HEAD.BATCH_SIZE]
         else:
-            return inter_class_logits, inter_pred_bboxes, inter_pred_masks, inter_pred_label, proposal_features, gt_masks, idx, rec_map, nr_boxes
+            return inter_class_logits, inter_pred_bboxes, inter_pred_masks, inter_pred_label, proposal_features, gt_masks, idx, rec_map, nr_boxes_per_img
 
     def forward(self, features, init_bboxes, init_features, targets = None, mask_encoding = None, matcher=None):
     
@@ -263,7 +271,7 @@ class DynamicHead(nn.Module):
             rec_result = torch.from_numpy(np.array(rec_result))
         if self.return_intermediate:
             return torch.stack(inter_class_logits), torch.stack(inter_pred_bboxes), torch.stack(inter_pred_masks), rec_result
-        return class_logits[None], pred_bboxes[None], mask_logits[None]
+        return class_logits, bboxes, mask_logits, rec_result
 
 
 class RCNNHead(nn.Module):
