@@ -85,6 +85,8 @@ def add_SWINTS_config(cfg):
     cfg.TEST.PMSI.ENABLED = False
     # Conservative defaults for cross-dataset balance (ICDAR/CTW/Total-Text)
     cfg.TEST.PMSI.SCALES = [1.0, 1.2, 1.35]
+    # Optional rotation TTA (degrees). Keep [0] for no rotation.
+    cfg.TEST.PMSI.ROTATIONS = [0]
     cfg.TEST.PMSI.MAX_RESOLUTION = 1920
     cfg.TEST.PMSI.SKIP_LARGE_GT = 1400
     cfg.TEST.PMSI.SKIP_VERY_LARGE_GT = 1000
