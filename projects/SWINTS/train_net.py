@@ -94,7 +94,6 @@ class ProgressiveMultiScaleInference(nn.Module):
         self.min_confident_count = getattr(pmsi_cfg, "MIN_CONFIDENT_COUNT", 6)
         self.conf_thresh = getattr(pmsi_cfg, "CONF_THRESH", 0.45)
         self.small_image_trigger = getattr(pmsi_cfg, "SMALL_IMAGE_TRIGGER", 1100)
-        self.short_side_trigger = getattr(pmsi_cfg, "SHORT_SIDE_TRIGGER", 0)
         self.cross_iou_thresh = getattr(pmsi_cfg, "CROSS_IOU_THRESH", 0.85)
         self.boost_per_match = getattr(pmsi_cfg, "BOOST_PER_MATCH", 0.02)
         self.max_boost = getattr(pmsi_cfg, "MAX_BOOST", 0.06)
@@ -117,7 +116,6 @@ class ProgressiveMultiScaleInference(nn.Module):
             image = input_dict["image"]
             c, h, w = image.shape
             max_dim = max(h, w)
-            min_dim = min(h, w)
 
             start = time.perf_counter()
 
@@ -149,14 +147,8 @@ class ProgressiveMultiScaleInference(nn.Module):
                 scores = scores.max(dim=1)[0]
 
             num_confident = (scores > self.conf_thresh).sum().item()
-            # Trigger extra scales if predictions are weak, image long-side is small,
-            # or short-side is below a configurable threshold for elongated inputs.
-            short_side_hit = self.short_side_trigger > 0 and min_dim < self.short_side_trigger
-            needs_more = (
-                num_confident < self.min_confident_count
-                or max_dim < self.small_image_trigger
-                or short_side_hit
-            )
+            # Trigger extra scales if predictions are weak or image long-side is small.
+            needs_more = num_confident < self.min_confident_count or max_dim < self.small_image_trigger
 
             if needs_more:
                 triggered_images += 1
