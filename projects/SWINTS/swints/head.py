@@ -164,6 +164,12 @@ class DynamicHead(nn.Module):
             idx = None
             scores = torch.sigmoid(class_logits)
             num_cls = class_logits.shape[-1]
+            # obj_features from RCNNHead is shaped as (1, N * nr_boxes, hidden_dim).
+            # Convert it to per-image layout before looping over the batch.
+            if in_proposal_features.dim() == 3 and in_proposal_features.shape[0] == 1:
+                in_proposal_features = in_proposal_features.view(N, nr_boxes, self.hidden_dim)
+            elif in_proposal_features.dim() == 2:
+                in_proposal_features = in_proposal_features.view(N, nr_boxes, self.hidden_dim)
             labels = torch.arange(num_cls, device=bboxes.device).\
                     unsqueeze(0).repeat(nr_boxes, 1).flatten(0, 1)
             inter_class_logits = []

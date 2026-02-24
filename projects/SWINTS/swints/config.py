@@ -78,3 +78,23 @@ def add_SWINTS_config(cfg):
     # Test config
     cfg.TEST.USE_NMS_IN_TSET = True
     cfg.TEST.INFERENCE_TH_TEST = 0.4
+    # Progressive Multi-Scale Inference (PMSI)
+    # Keep this independent from Detectron2 TEST.AUG so baseline/TTA/PMSI
+    # can be toggled separately for fair comparisons.
+    cfg.TEST.PMSI = CN()
+    cfg.TEST.PMSI.ENABLED = False
+    # Conservative defaults for cross-dataset balance (ICDAR/CTW/Total-Text)
+    cfg.TEST.PMSI.SCALES = [1.0, 1.2, 1.35]
+    cfg.TEST.PMSI.MAX_RESOLUTION = 1920
+    cfg.TEST.PMSI.SKIP_LARGE_GT = 1400
+    cfg.TEST.PMSI.SKIP_VERY_LARGE_GT = 1000
+    cfg.TEST.PMSI.MIN_CONFIDENT_COUNT = 6
+    cfg.TEST.PMSI.CONF_THRESH = 0.45
+    # Always run extra scales for images below this max-side threshold.
+    cfg.TEST.PMSI.SMALL_IMAGE_TRIGGER = 1100
+    cfg.TEST.PMSI.CROSS_IOU_THRESH = 0.85
+    # Keep cross-scale boosting explicit for fair ablations.
+    cfg.TEST.PMSI.ENABLE_SCORE_BOOST = True
+    cfg.TEST.PMSI.BOOST_PER_MATCH = 0.02
+    cfg.TEST.PMSI.MAX_BOOST = 0.06
+    cfg.TEST.PMSI.MERGE_NMS_THRESH = 0.6

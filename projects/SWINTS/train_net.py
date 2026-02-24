@@ -13,6 +13,7 @@ import os
 import itertools
 import time
 import copy
+import logging
 from typing import Any, Dict, List, Set
 
 import torch
@@ -32,30 +33,99 @@ from detectron2.layers import nms
 from swints import SWINTSDatasetMapper, add_SWINTS_config
 
 
-class ProgressiveMultiScaleInference(nn.Module):
-    def __init__(self, model, scales=None):
+logger = logging.getLogger(__name__)
+
+
+def _average_inference_time(times):
+    """Return average inference time in seconds for a list of timings."""
+    return sum(times) / len(times) if times else 0.0
+
+
+def _safe_ratio(numerator, denominator):
+    """Return percentage ratio in [0, 100] with safe zero-denominator handling."""
+    return (100.0 * numerator / denominator) if denominator else 0.0
+
+
+class InferenceTimingWrapper(nn.Module):
+    """Simple eval-time wrapper to report baseline average per-image inference time."""
+
+    def __init__(self, model):
         super().__init__()
         self.model = model
-        # Default scales if not provided
-        self.scales = scales if scales is not None else [1.0, 1.25, 1.5]
 
     def forward(self, batched_inputs):
         if self.training:
             return self.model(batched_inputs)
 
         all_results = []
+        timings = []
+        total_images = 0
+        triggered_images = 0
+        multiscale_images = 0
+        total_extra_scales = 0
+
         for input_dict in batched_inputs:
+            total_images += 1
+            start = time.perf_counter()
+            with torch.no_grad():
+                output = self.model([input_dict])[0]
+            timings.append(time.perf_counter() - start)
+            all_results.append(output)
+
+        if comm.is_main_process() and timings:
+            avg_ms = _average_inference_time(timings) * 1000.0
+            logger.info(f"[Baseline] Average per-image inference time: {avg_ms:.2f} ms")
+
+        return all_results
+
+
+class ProgressiveMultiScaleInference(nn.Module):
+    def __init__(self, model, scales=None, cfg=None):
+        super().__init__()
+        self.model = model
+        # Default scales if not provided
+        self.scales = scales if scales is not None else [1.0, 1.2, 1.35]
+
+        # Tunable PMSI heuristics for cross-dataset balancing.
+        pmsi_cfg = getattr(getattr(cfg, "TEST", None), "PMSI", None) if cfg is not None else None
+        self.max_resolution = getattr(pmsi_cfg, "MAX_RESOLUTION", 1920)
+        self.skip_large_gt = getattr(pmsi_cfg, "SKIP_LARGE_GT", 1400)
+        self.skip_very_large_gt = getattr(pmsi_cfg, "SKIP_VERY_LARGE_GT", 1000)
+        self.min_confident_count = getattr(pmsi_cfg, "MIN_CONFIDENT_COUNT", 6)
+        self.conf_thresh = getattr(pmsi_cfg, "CONF_THRESH", 0.45)
+        self.small_image_trigger = getattr(pmsi_cfg, "SMALL_IMAGE_TRIGGER", 1100)
+        self.cross_iou_thresh = getattr(pmsi_cfg, "CROSS_IOU_THRESH", 0.85)
+        self.boost_per_match = getattr(pmsi_cfg, "BOOST_PER_MATCH", 0.02)
+        self.max_boost = getattr(pmsi_cfg, "MAX_BOOST", 0.06)
+        self.enable_score_boost = getattr(pmsi_cfg, "ENABLE_SCORE_BOOST", True)
+        self.merge_nms_thresh = getattr(pmsi_cfg, "MERGE_NMS_THRESH", 0.6)
+
+    def forward(self, batched_inputs):
+        if self.training:
+            return self.model(batched_inputs)
+
+        all_results = []
+        timings = []
+        total_images = 0
+        triggered_images = 0
+        multiscale_images = 0
+        total_extra_scales = 0
+
+        for input_dict in batched_inputs:
+            total_images += 1
             image = input_dict["image"]
             c, h, w = image.shape
             max_dim = max(h, w)
+
+            start = time.perf_counter()
 
             # Use provided scales, but apply adaptive filtering for speed
             curr_scales = []
             for s in self.scales:
                 # Heuristic to skip large scales for already large images
-                if s > 1.0 and max_dim > 1500:
+                if s > 1.0 and max_dim > self.skip_large_gt:
                     continue
-                if s > 1.25 and max_dim > 1000:
+                if s > 1.25 and max_dim > self.skip_very_large_gt:
                     continue
                 curr_scales.append(s)
 
@@ -76,17 +146,18 @@ class ProgressiveMultiScaleInference(nn.Module):
             if scores.dim() > 1:
                 scores = scores.max(dim=1)[0]
 
-            num_confident = (scores > 0.4).sum().item()
-            needs_more = num_confident < 8 or max_dim < 1100
+            num_confident = (scores > self.conf_thresh).sum().item()
+            needs_more = num_confident < self.min_confident_count or max_dim < self.small_image_trigger
 
             if needs_more:
+                triggered_images += 1
                 additional_inputs = []
                 for scale in curr_scales:
                     if scale == 1.0:
                         continue
 
                     # Cap maximum resolution to prevent extreme slowness/OOM
-                    max_res = 2240
+                    max_res = self.max_resolution
                     new_h, new_w = int(h * scale), int(w * scale)
                     if max(new_h, new_w) > max_res:
                         scale_factor = max_res / max(new_h, new_w)
@@ -103,6 +174,7 @@ class ProgressiveMultiScaleInference(nn.Module):
                     curr_input["image"] = curr_image
                     additional_inputs.append(curr_input)
 
+                total_extra_scales += len(additional_inputs)
                 if additional_inputs:
                     with torch.no_grad():
                         # Run additional scales in parallel via batching
@@ -111,6 +183,9 @@ class ProgressiveMultiScaleInference(nn.Module):
                             multi_scale_instances.append(out["instances"])
 
             # 3. Merge results
+            if len(multi_scale_instances) > 1:
+                multiscale_images += 1
+
             if len(multi_scale_instances) == 1:
                 # If only one scale, return as is (baseline behavior)
                 merged_instances = multi_scale_instances[0]
@@ -128,36 +203,53 @@ class ProgressiveMultiScaleInference(nn.Module):
                     merged_instances = merged_instances[areas > 0.1]
 
                 if len(merged_instances) > 0:
-                    # Cross-scale score boost
-                    ious = pairwise_iou(merged_instances.pred_boxes, merged_instances.pred_boxes)
-                    scale_ids = merged_instances.scale_id
-                    # Different scales mask: True where scale_ids are different
-                    diff_scales = scale_ids.unsqueeze(0) != scale_ids.unsqueeze(1)
+                    if self.enable_score_boost:
+                        # Cross-scale score boost
+                        ious = pairwise_iou(merged_instances.pred_boxes, merged_instances.pred_boxes)
+                        scale_ids = merged_instances.scale_id
+                        # Different scales mask: True where scale_ids are different
+                        diff_scales = scale_ids.unsqueeze(0) != scale_ids.unsqueeze(1)
 
-                    # Overlap from different scales
-                    cross_overlaps = (ious > 0.8) & diff_scales
-                    num_cross_overlaps = cross_overlaps.sum(dim=1).float()
+                        # Overlap from different scales
+                        cross_overlaps = (ious > self.cross_iou_thresh) & diff_scales
+                        num_cross_overlaps = cross_overlaps.sum(dim=1).float()
 
-                    # Boost score (max 0.15 boost for multi-scale consistency)
-                    boost = torch.clamp(num_cross_overlaps * 0.05, max=0.15)
+                        # Boost score (max 0.15 boost for multi-scale consistency)
+                        boost = torch.clamp(num_cross_overlaps * self.boost_per_match, max=self.max_boost)
 
-                    if merged_instances.scores.dim() > 1:
-                        merged_instances.scores = merged_instances.scores + boost.unsqueeze(1)
-                    else:
-                        merged_instances.scores = merged_instances.scores + boost
-                    merged_instances.scores = torch.clamp(merged_instances.scores, max=1.0)
+                        if merged_instances.scores.dim() > 1:
+                            merged_instances.scores = merged_instances.scores + boost.unsqueeze(1)
+                        else:
+                            merged_instances.scores = merged_instances.scores + boost
+                        merged_instances.scores = torch.clamp(merged_instances.scores, max=1.0)
 
                     # NMS to remove redundancies across scales
                     scores = merged_instances.scores
                     max_scores = scores.max(dim=1)[0] if scores.dim() > 1 else scores
 
                     # Keep a bit more to let TextEvaluator's polygon NMS do the final work
-                    keep = nms(merged_instances.pred_boxes.tensor, max_scores, iou_threshold=0.7)
+                    keep = nms(merged_instances.pred_boxes.tensor, max_scores, iou_threshold=self.merge_nms_thresh)
                     merged_instances = merged_instances[keep.to("cpu")]
 
             # Ensure all tensors are on CPU for the evaluator
             merged_instances = merged_instances.to(torch.device("cpu"))
             all_results.append({"instances": merged_instances})
+            timings.append(time.perf_counter() - start)
+
+        if comm.is_main_process() and timings:
+            avg_ms = _average_inference_time(timings) * 1000.0
+            logger.info(f"[PMSI] Average per-image inference time: {avg_ms:.2f} ms")
+
+            # Scale Activation Analysis: quantify how often PMSI trigger/scales are activated.
+            trigger_rate = _safe_ratio(triggered_images, total_images)
+            multiscale_rate = _safe_ratio(multiscale_images, total_images)
+            avg_extra_scales = (total_extra_scales / total_images) if total_images else 0.0
+            logger.info(
+                "[PMSI] Scale Activation Analysis | "
+                f"trigger_rate={trigger_rate:.2f}% ({triggered_images}/{total_images}), "
+                f"multiscale_rate={multiscale_rate:.2f}% ({multiscale_images}/{total_images}), "
+                f"avg_extra_scales_per_image={avg_extra_scales:.3f}"
+            )
 
         return all_results
 
@@ -169,10 +261,13 @@ class Trainer(DefaultTrainer):
 
     @classmethod
     def test(cls, cfg, model, evaluators=None):
-        # Wrap the model for multi-scale inference during evaluation if TTA is enabled
-        if cfg.TEST.AUG.ENABLED and not isinstance(model, ProgressiveMultiScaleInference):
-            scales = cfg.TEST.AUG.get("SCALES", [1.0, 1.25, 1.5])
-            model = ProgressiveMultiScaleInference(model, scales=scales)
+        # Wrap with explicit timing helpers for transparent baseline vs PMSI speed comparison.
+        # Baseline/pipeline separation is still preserved via TEST.PMSI.ENABLED.
+        if cfg.TEST.PMSI.ENABLED and not isinstance(model, ProgressiveMultiScaleInference):
+            scales = cfg.TEST.PMSI.SCALES
+            model = ProgressiveMultiScaleInference(model, scales=scales, cfg=cfg)
+        elif not cfg.TEST.PMSI.ENABLED and not isinstance(model, InferenceTimingWrapper):
+            model = InferenceTimingWrapper(model)
         return super().test(cfg, model, evaluators)
 
     @classmethod
