@@ -92,6 +92,8 @@ def add_SWINTS_config(cfg):
     cfg.TEST.PMSI.CONF_THRESH = 0.45
     # Always run extra scales for images below this max-side threshold.
     cfg.TEST.PMSI.SMALL_IMAGE_TRIGGER = 1100
+    # Optional short-side trigger for long-and-thin images (0 disables it).
+    cfg.TEST.PMSI.SHORT_SIDE_TRIGGER = 1100
     cfg.TEST.PMSI.CROSS_IOU_THRESH = 0.85
     # Keep cross-scale boosting explicit for fair ablations.
     cfg.TEST.PMSI.ENABLE_SCORE_BOOST = True
