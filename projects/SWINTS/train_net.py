@@ -46,22 +46,6 @@ def _safe_ratio(numerator, denominator):
     return (100.0 * numerator / denominator) if denominator else 0.0
 
 
-def _rotate_image_180(image):
-    """Rotate CHW tensor by 180 degrees."""
-    return torch.rot90(image, k=2, dims=(1, 2))
-
-
-def _map_boxes_from_rot180(pred_boxes, height, width):
-    """Map XYXY boxes from 180-rotated image coordinates back to original image."""
-    boxes = pred_boxes.tensor.clone()
-    x1 = width - boxes[:, 2]
-    y1 = height - boxes[:, 3]
-    x2 = width - boxes[:, 0]
-    y2 = height - boxes[:, 1]
-    boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3] = x1, y1, x2, y2
-    pred_boxes.tensor = boxes
-
-
 class InferenceTimingWrapper(nn.Module):
     """Simple eval-time wrapper to report baseline average per-image inference time."""
 
@@ -105,7 +89,6 @@ class ProgressiveMultiScaleInference(nn.Module):
         # Tunable PMSI heuristics for cross-dataset balancing.
         pmsi_cfg = getattr(getattr(cfg, "TEST", None), "PMSI", None) if cfg is not None else None
         self.max_resolution = getattr(pmsi_cfg, "MAX_RESOLUTION", 1920)
-        self.rotations = list(getattr(pmsi_cfg, "ROTATIONS", [0]))
         self.skip_large_gt = getattr(pmsi_cfg, "SKIP_LARGE_GT", 1400)
         self.skip_very_large_gt = getattr(pmsi_cfg, "SKIP_VERY_LARGE_GT", 1000)
         self.min_confident_count = getattr(pmsi_cfg, "MIN_CONFIDENT_COUNT", 6)
@@ -170,46 +153,35 @@ class ProgressiveMultiScaleInference(nn.Module):
             if needs_more:
                 triggered_images += 1
                 additional_inputs = []
-                aug_meta = []
                 for scale in curr_scales:
-                    for rotation in self.rotations:
-                        if scale == 1.0 and rotation == 0:
-                            continue
-                        if rotation not in (0, 180):
-                            continue
+                    if scale == 1.0:
+                        continue
 
-                        # Cap maximum resolution to prevent extreme slowness/OOM
-                        max_res = self.max_resolution
-                        new_h, new_w = int(h * scale), int(w * scale)
-                        if max(new_h, new_w) > max_res:
-                            scale_factor = max_res / max(new_h, new_w)
-                            new_h, new_w = int(new_h * scale_factor), int(new_w * scale_factor)
+                    # Cap maximum resolution to prevent extreme slowness/OOM
+                    max_res = self.max_resolution
+                    new_h, new_w = int(h * scale), int(w * scale)
+                    if max(new_h, new_w) > max_res:
+                        scale_factor = max_res / max(new_h, new_w)
+                        new_h, new_w = int(new_h * scale_factor), int(new_w * scale_factor)
 
-                        curr_image = F.interpolate(
-                            image.unsqueeze(0).float(),
-                            size=(new_h, new_w),
-                            mode='bilinear',
-                            align_corners=False
-                        ).squeeze(0).to(image.dtype)
+                    curr_image = F.interpolate(
+                        image.unsqueeze(0).float(),
+                        size=(new_h, new_w),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(0).to(image.dtype)
 
-                        if rotation == 180:
-                            curr_image = _rotate_image_180(curr_image)
-
-                        curr_input = copy.copy(input_dict)
-                        curr_input["image"] = curr_image
-                        additional_inputs.append(curr_input)
-                        aug_meta.append((new_h, new_w, rotation))
+                    curr_input = copy.copy(input_dict)
+                    curr_input["image"] = curr_image
+                    additional_inputs.append(curr_input)
 
                 total_extra_scales += len(additional_inputs)
                 if additional_inputs:
                     with torch.no_grad():
-                        # Run additional augmentations in parallel via batching
+                        # Run additional scales in parallel via batching
                         additional_outputs = self.model(additional_inputs)
-                        for out, (ah, aw, rotation) in zip(additional_outputs, aug_meta):
-                            inst = out["instances"]
-                            if rotation == 180 and len(inst) > 0:
-                                _map_boxes_from_rot180(inst.pred_boxes, ah, aw)
-                            multi_scale_instances.append(inst)
+                        for out in additional_outputs:
+                            multi_scale_instances.append(out["instances"])
 
             # 3. Merge results
             if len(multi_scale_instances) > 1:
