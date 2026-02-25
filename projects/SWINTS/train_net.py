@@ -63,6 +63,10 @@ class InferenceTimingWrapper(nn.Module):
         triggered_images = 0
         multiscale_images = 0
         total_extra_scales = 0
+        scale_usage = {float(sc): 0 for sc in self.scales}
+        if 1.0 not in scale_usage:
+            scale_usage[1.0] = 0
+        total_scales_used = 0
 
         for input_dict in batched_inputs:
             total_images += 1
@@ -83,6 +87,7 @@ class ProgressiveMultiScaleInference(nn.Module):
     def __init__(self, model, scales=None, cfg=None):
         super().__init__()
         self.model = model
+        self.dataset_label = ",".join(getattr(getattr(cfg, "DATASETS", None), "TEST", [])) if cfg is not None else "unknown"
         # Default scales if not provided
         self.scales = scales if scales is not None else [1.0, 1.2, 1.35]
 
@@ -110,6 +115,10 @@ class ProgressiveMultiScaleInference(nn.Module):
         triggered_images = 0
         multiscale_images = 0
         total_extra_scales = 0
+        scale_usage = {float(sc): 0 for sc in self.scales}
+        if 1.0 not in scale_usage:
+            scale_usage[1.0] = 0
+        total_scales_used = 0
 
         for input_dict in batched_inputs:
             total_images += 1
@@ -131,6 +140,9 @@ class ProgressiveMultiScaleInference(nn.Module):
 
             if not curr_scales:
                 curr_scales = [1.0]
+
+            # Track per-image scale usage for analysis logging.
+            used_scales = [1.0]
 
             multi_scale_instances = []
             # 1. First pass (Base Scale)
@@ -174,6 +186,7 @@ class ProgressiveMultiScaleInference(nn.Module):
                     curr_input = copy.copy(input_dict)
                     curr_input["image"] = curr_image
                     additional_inputs.append(curr_input)
+                    used_scales.append(float(scale))
 
                 total_extra_scales += len(additional_inputs)
                 if additional_inputs:
@@ -182,6 +195,15 @@ class ProgressiveMultiScaleInference(nn.Module):
                         additional_outputs = self.model(additional_inputs)
                         for out in additional_outputs:
                             multi_scale_instances.append(out["instances"])
+
+
+            # Aggregate scale usage stats once per image.
+            used_scales = sorted(set(used_scales))
+            total_scales_used += len(used_scales)
+            for sc in used_scales:
+                if sc not in scale_usage:
+                    scale_usage[sc] = 0
+                scale_usage[sc] += 1
 
             # 3. Merge results
             if len(multi_scale_instances) > 1:
@@ -245,11 +267,19 @@ class ProgressiveMultiScaleInference(nn.Module):
             trigger_rate = _safe_ratio(triggered_images, total_images)
             multiscale_rate = _safe_ratio(multiscale_images, total_images)
             avg_extra_scales = (total_extra_scales / total_images) if total_images else 0.0
+            scale_usage_parts = []
+            for sc in sorted(scale_usage.keys()):
+                rate = _safe_ratio(scale_usage[sc], total_images)
+                scale_usage_parts.append(f"s={sc:g}:{rate:.2f}% ({scale_usage[sc]}/{total_images})")
+            avg_scales_used = (total_scales_used / total_images) if total_images else 0.0
             logger.info(
                 "[PMSI] Scale Activation Analysis | "
+                f"dataset={self.dataset_label}, "
                 f"trigger_rate={trigger_rate:.2f}% ({triggered_images}/{total_images}), "
                 f"multiscale_rate={multiscale_rate:.2f}% ({multiscale_images}/{total_images}), "
-                f"avg_extra_scales_per_image={avg_extra_scales:.3f}"
+                f"avg_scales_used={avg_scales_used:.3f}, "
+                f"avg_extra_scales_per_image={avg_extra_scales:.3f}, "
+                f"scale_usage=[{'; '.join(scale_usage_parts)}]"
             )
 
         return all_results
