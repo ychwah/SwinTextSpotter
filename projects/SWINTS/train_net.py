@@ -59,17 +59,8 @@ class InferenceTimingWrapper(nn.Module):
 
         all_results = []
         timings = []
-        total_images = 0
-        triggered_images = 0
-        multiscale_images = 0
-        total_extra_scales = 0
-        scale_usage = {float(sc): 0 for sc in self.scales}
-        if 1.0 not in scale_usage:
-            scale_usage[1.0] = 0
-        total_scales_used = 0
 
         for input_dict in batched_inputs:
-            total_images += 1
             start = time.perf_counter()
             with torch.no_grad():
                 output = self.model([input_dict])[0]
