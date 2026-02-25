@@ -33,7 +33,7 @@ from detectron2.layers import nms
 from swints import SWINTSDatasetMapper, add_SWINTS_config
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("detectron2")
 
 
 def _average_inference_time(times):
@@ -105,6 +105,13 @@ class ProgressiveMultiScaleInference(nn.Module):
         self.max_boost = getattr(pmsi_cfg, "MAX_BOOST", 0.06)
         self.enable_score_boost = getattr(pmsi_cfg, "ENABLE_SCORE_BOOST", True)
         self.merge_nms_thresh = getattr(pmsi_cfg, "MERGE_NMS_THRESH", 0.6)
+        # Running aggregates across forward() calls so logs remain visible in long eval loops.
+        self._agg_total_images = 0
+        self._agg_triggered_images = 0
+        self._agg_multiscale_images = 0
+        self._agg_total_extra_scales = 0
+        self._agg_total_scales_used = 0
+        self._agg_scale_usage = {}
 
     def forward(self, batched_inputs):
         if self.training:
@@ -264,31 +271,33 @@ class ProgressiveMultiScaleInference(nn.Module):
             avg_ms = _average_inference_time(timings) * 1000.0
             logger.info(f"[PMSI] Average per-image inference time: {avg_ms:.2f} ms")
 
-            # Scale Activation Analysis: quantify how often PMSI trigger/scales are activated.
-            trigger_rate = _safe_ratio(triggered_images, total_images)
-            multiscale_rate = _safe_ratio(multiscale_images, total_images)
-            avg_extra_scales = (total_extra_scales / total_images) if total_images else 0.0
-            scale_usage_parts = []
-            for sc in sorted(scale_usage.keys()):
-                rate = _safe_ratio(scale_usage[sc], total_images)
-                scale_usage_parts.append(f"s={sc:g}:{rate:.2f}% ({scale_usage[sc]}/{total_images})")
-            avg_scales_used = (total_scales_used / total_images) if total_images else 0.0
-            logger.info(
-                "[PMSI] Scale Activation Analysis | "
-                f"dataset={self.dataset_label}, "
-                f"trigger_rate={trigger_rate:.2f}% ({triggered_images}/{total_images}), "
-                f"multiscale_rate={multiscale_rate:.2f}% ({multiscale_images}/{total_images}), "
-                f"avg_scales_used={avg_scales_used:.3f}, "
-                f"avg_extra_scales_per_image={avg_extra_scales:.3f}, "
-                f"scale_usage=[{'; '.join(scale_usage_parts)}]"
-            )
-            logger.info(
-                "[PMSI] Scale Activation Table | "
-                f"Dataset={self.dataset_label} | "
-                f"Activation Rate (%)={multiscale_rate:.2f} | "
-                f"Avg Scales Used={avg_scales_used:.3f} | "
-                f"Per-Scale={'; '.join(scale_usage_parts)}"
-            )
+            # Aggregate stats across all forward() calls in evaluator loop.
+            self._agg_total_images += total_images
+            self._agg_triggered_images += triggered_images
+            self._agg_multiscale_images += multiscale_images
+            self._agg_total_extra_scales += total_extra_scales
+            self._agg_total_scales_used += total_scales_used
+            for sc, cnt in scale_usage.items():
+                self._agg_scale_usage[sc] = self._agg_scale_usage.get(sc, 0) + cnt
+
+            # Emit a visible summary periodically (every 50 images) so it shows in logs.
+            if self._agg_total_images % 50 == 0:
+                trigger_rate = _safe_ratio(self._agg_triggered_images, self._agg_total_images)
+                multiscale_rate = _safe_ratio(self._agg_multiscale_images, self._agg_total_images)
+                avg_extra_scales = (self._agg_total_extra_scales / self._agg_total_images) if self._agg_total_images else 0.0
+                avg_scales_used = (self._agg_total_scales_used / self._agg_total_images) if self._agg_total_images else 0.0
+                scale_usage_parts = []
+                for sc in sorted(self._agg_scale_usage.keys()):
+                    rate = _safe_ratio(self._agg_scale_usage[sc], self._agg_total_images)
+                    scale_usage_parts.append(f"s={sc:g}:{rate:.2f}% ({self._agg_scale_usage[sc]}/{self._agg_total_images})")
+                logger.info(
+                    "[PMSI] Scale Activation Table | "
+                    f"Dataset={self.dataset_label} | "
+                    f"Activation Rate (%)={multiscale_rate:.2f} | "
+                    f"Avg Scales Used={avg_scales_used:.3f} | "
+                    f"Avg Extra Scales={avg_extra_scales:.3f} | "
+                    f"Per-Scale={'; '.join(scale_usage_parts)}"
+                )
 
         return all_results
 
