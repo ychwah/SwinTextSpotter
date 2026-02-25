@@ -79,6 +79,7 @@ class InferenceTimingWrapper(nn.Module):
         if comm.is_main_process() and timings:
             avg_ms = _average_inference_time(timings) * 1000.0
             logger.info(f"[Baseline] Average per-image inference time: {avg_ms:.2f} ms")
+            logger.info("[Baseline] Scale Activation Analysis: N/A (enable TEST.PMSI.ENABLED=True to compute it)")
 
         return all_results
 
@@ -280,6 +281,13 @@ class ProgressiveMultiScaleInference(nn.Module):
                 f"avg_scales_used={avg_scales_used:.3f}, "
                 f"avg_extra_scales_per_image={avg_extra_scales:.3f}, "
                 f"scale_usage=[{'; '.join(scale_usage_parts)}]"
+            )
+            logger.info(
+                "[PMSI] Scale Activation Table | "
+                f"Dataset={self.dataset_label} | "
+                f"Activation Rate (%)={multiscale_rate:.2f} | "
+                f"Avg Scales Used={avg_scales_used:.3f} | "
+                f"Per-Scale={'; '.join(scale_usage_parts)}"
             )
 
         return all_results
